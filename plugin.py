@@ -72,8 +72,19 @@ class PluginSectionConfig(PluginConfigBase):
         description="允许执行「手动冻结 / 解冻」命令的用户 ID，留空时仅本地 operator 可用。",
         json_schema_extra={"label": "管理员用户 ID", "placeholder": "例如 10001,10002"},
     )
+    allow_llm_unfreeze: bool = Field(
+        default=False,
+        description=(
+            "是否允许模型通过 unfreeze_model 工具解冻模型（默认关闭）。"
+            "该工具的参数由模型生成，宿主会把模型给的参数与调用上下文合并，"
+            "模型可以自带 user_id 绕过管理员校验，所以工具路径上的写入能力"
+            "存在权限边界风险；确实需要让模型自主解冻时再打开。"
+            "/429解冻 命令不受此开关影响（命令的身份来自消息上下文，不经过模型）。"
+        ),
+        json_schema_extra={"label": "允许模型调用解冻工具（有权限边界风险）"},
+    )
     config_version: str = Field(
-        default="1.2.3",
+        default="1.2.6",
         description="配置版本（请勿手改）。",
         json_schema_extra={"label": "配置版本", "disabled": True},
     )
@@ -799,15 +810,25 @@ class ModelFailoverPlugin(MaiBotPlugin):
         ],
     )
     async def tool_unfreeze(self, task: str = "", model: str = "", **kwargs: Any) -> Dict[str, str]:
-        """给 LLM 的解冻工具（与 ``/429解冻`` 同权限：仅插件管理员可用）。
+        """给 LLM 的解冻工具（默认**关闭**，由配置项 ``allow_llm_unfreeze`` 打开）。
 
-        工具会被模型自主调用，因此这里必须和命令走同一道管理员校验 —— 否则任何
-        能让机器人调用工具的聊天用户都能绕过 ``/429解冻`` 的权限限制去改写宿主配置。
-        宿主会把 ``user_id`` / ``group_id`` / ``platform`` / ``stream_id`` 放进工具
-        handler 的 kwargs（``component_query.py::_build_tool_context_payload``）。
+        为什么不默认放开：这个工具的参数是**模型生成**的，而宿主把模型给的参数与调用
+        上下文合并时是「已有键优先」——模型只要在工具参数里自带 ``user_id``，就会盖住
+        宿主注入的那一份。宿主侧在这条链路上没有任何 schema 校验
+        （``reasoning_engine.py`` 原样收下 ``tool_call.args``），插件也就无法分辨这个
+        ``user_id`` 究竟来自宿主还是模型。因此这里把「模型能否改写宿主配置」做成显式
+        开关，默认关闭；关闭时即使模型伪造身份也触发不了任何写入。
+        打开后仍会做一次 ``is_admin`` 校验（best-effort，能挡住不经意的调用）。
         """
 
         settings = build_settings(self.config)
+        if not settings.allow_llm_unfreeze:
+            return {
+                "content": (
+                    "解冻工具默认关闭（工具参数由模型生成，无法可信校验调用者身份）；"
+                    "请管理员使用 /429解冻 命令，或在插件设置里打开「允许模型调用解冻工具」。"
+                )
+            }
         if not settings.is_admin(
             str(kwargs.get("user_id", "")),
             bool(kwargs.get("is_local_operator")),

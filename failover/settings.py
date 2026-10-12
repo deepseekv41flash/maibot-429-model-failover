@@ -32,6 +32,8 @@ class FailoverSettings:
 
     enabled: bool = True
     admin_user_ids: Tuple[str, ...] = ()
+    allow_llm_unfreeze: bool = False
+    """是否允许模型通过 ``unfreeze_model`` 工具解冻（默认关闭，见 README 的权限边界说明）。"""
     poll_interval_seconds: float = 3.0
     status_codes: Tuple[int, ...] = (429,)
     detect_rate_limit_by_type: bool = True
@@ -182,6 +184,7 @@ def build_settings(config: object) -> FailoverSettings:
     return FailoverSettings(
         enabled=bool(pick(plugin, "enabled", True)),
         admin_user_ids=_to_str_tuple(pick(plugin, "admin_user_ids", [])),  # type: ignore[arg-type]
+        allow_llm_unfreeze=bool(pick(plugin, "allow_llm_unfreeze", False)),
         poll_interval_seconds=max(0.5, float(pick(detect, "poll_interval_seconds", 3.0))),
         status_codes=pick_codes(detect),
         detect_rate_limit_by_type=bool(pick(detect, "detect_rate_limit_by_type", True)),

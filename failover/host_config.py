@@ -468,13 +468,25 @@ class HostModelConfig:
     # ------------------------------------------------------------------ 写入
 
     def backup(self, text: str, backup_dir: Path, keep: int = 10) -> Optional[Path]:
-        """把当前文件文本备份到插件数据目录。"""
+        """把当前文件文本备份到插件数据目录。
+
+        备份是**完整**的宿主配置（含 ``[[api_providers]]`` 的 api_key），因此写完后
+        收紧文件权限（POSIX 上 0600，只留属主可读写）；Windows 上 ``os.chmod`` 语义
+        有限，失败时忽略，不影响备份本身。
+
+        Args:
+            text: 当前配置文本。
+            backup_dir: 备份目录（插件数据目录下的 ``backups/``）。
+            keep: 保留份数；``<= 0`` 表示不写备份（由调用方 ``apply()`` 提前跳过）。
+        """
 
         try:
             backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             target = backup_dir / f"model_config_{stamp}.toml"
             target.write_text(text, encoding="utf-8")
+            with contextlib.suppress(OSError):
+                os.chmod(target, 0o600)
             self._prune_backups(backup_dir, keep)
             return target
         except OSError as exc:
@@ -558,7 +570,8 @@ class HostModelConfig:
         Args:
             updates: ``{任务: 新的模型列表}``。
             backup_dir: 备份目录；为 ``None`` 时跳过备份。
-            backup_keep: 备份保留数量。
+            backup_keep: 备份保留份数；``<= 0`` 表示**不写备份**（与配置项
+                「保留备份份数」的字面语义一致；已有备份不会被删除）。
             dry_run: 为 ``True`` 时只渲染与校验，不写盘。
 
         Returns:
@@ -578,7 +591,8 @@ class HostModelConfig:
         if dry_run:
             return ApplyResult(changed=True, reason="演练模式：未写入", new_text=new_text, written=False)
 
-        backup_path = self.backup(old_text, backup_dir, backup_keep) if backup_dir is not None else None
+        write_backup = backup_dir is not None and backup_keep > 0
+        backup_path = self.backup(old_text, backup_dir, backup_keep) if write_backup else None
         self.write_in_place(new_text)
 
         try:

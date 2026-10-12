@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -966,6 +967,8 @@ def test_plugin_module_loads() -> None:
     assert config["detect"]["max_log_age_seconds"] == 300
     assert config["freeze"]["skip_if_no_valid_alternative"] is True
     assert config["detect"]["trigger_status_codes"] == [429]
+    assert config["plugin"]["allow_llm_unfreeze"] is False, "解冻工具必须默认关闭"
+    assert config["plugin"]["config_version"] == "1.2.6"
 
 
 def test_plugin_reload_confirmation_state_machine() -> None:
@@ -1030,13 +1033,17 @@ def test_describe_sources_hides_host_paths() -> None:
         assert "可用" in hidden, hidden
 
 
-def _config_stub(*, admin_ids: List[str]) -> Any:
+def _config_stub(*, admin_ids: List[str], allow_llm_unfreeze: bool = False) -> Any:
     """构造 ``build_settings`` 能用的最小配置对象（不依赖 SDK 的配置模型）。"""
 
     import types
 
     return types.SimpleNamespace(
-        plugin=types.SimpleNamespace(enabled=True, admin_user_ids=list(admin_ids)),
+        plugin=types.SimpleNamespace(
+            enabled=True,
+            admin_user_ids=list(admin_ids),
+            allow_llm_unfreeze=allow_llm_unfreeze,
+        ),
         detect=None,
         freeze=None,
         notify=None,
@@ -1044,7 +1051,7 @@ def _config_stub(*, admin_ids: List[str]) -> Any:
     )
 
 
-def _sendable_plugin(module: Any, *, admin_ids: List[str]) -> tuple:
+def _sendable_plugin(module: Any, *, admin_ids: List[str], allow_llm_unfreeze: bool = False) -> tuple:
     """按宿主方式构造插件实例，附一份最小配置与可观测的 ctx。"""
 
     import logging
@@ -1065,7 +1072,9 @@ def _sendable_plugin(module: Any, *, admin_ids: List[str]) -> tuple:
         logger=logging.getLogger("test.429-failover-permission"),
         send=_Send(),
     )
-    plugin._plugin_config_instance = _config_stub(admin_ids=admin_ids)
+    plugin._plugin_config_instance = _config_stub(
+        admin_ids=admin_ids, allow_llm_unfreeze=allow_llm_unfreeze
+    )
     return plugin, sent
 
 
@@ -1131,20 +1140,81 @@ def test_unfreeze_tool_requires_admin() -> None:
 
     plugin._manager = types.SimpleNamespace(unfreeze=_unfreeze)
 
-    # 普通用户（含模型被诱导调用的情况）：拒绝，且不产生任何改写
+    # 默认（开关关闭）：即使模型伪造出管理员 user_id，也不能触发任何改写
+    forged = asyncio.run(plugin.tool_unfreeze(task="utils", model="m", user_id="10001"))
+    assert calls == [], "开关关闭时不得触发解冻（伪造 user_id 也不行）"
+    assert "默认关闭" in forged["content"], forged
+
+    # 打开开关后，非管理员仍被拒
+    plugin._plugin_config_instance = _config_stub(admin_ids=["10001"], allow_llm_unfreeze=True)
     denied = asyncio.run(plugin.tool_unfreeze(task="utils", model="m", user_id="20002"))
     assert calls == [], "非管理员不得触发解冻"
     assert "管理员" in denied["content"], denied
 
-    # 上下文缺失 user_id（无法确认调用者）：同样拒绝（fail-closed）
+    # 打开开关后，上下文缺失 user_id 同样拒绝（fail-closed）
     denied_anon = asyncio.run(plugin.tool_unfreeze(task="utils", model="m"))
     assert calls == [], "缺少 user_id 时必须拒绝"
     assert "管理员" in denied_anon["content"], denied_anon
 
-    # 管理员：放行
+    # 打开开关 + 管理员：放行
     allowed = asyncio.run(plugin.tool_unfreeze(task="utils", model="m", user_id="10001"))
     assert calls == [("utils", "m")], calls
     assert "已解冻" in allowed["content"], allowed
+
+
+def test_backup_keep_zero_skips_backup() -> None:
+    """「保留备份份数 = 0」= 不写备份（此前是"不清理"，与字面语义相反）。"""
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        config_path, host, _store, _logger = _make_workspace(tmp)
+        backup_dir = tmp / "backups"
+
+        skipped = host.apply({"replyer": ["deepseek-v4-flash"]}, backup_dir=backup_dir, backup_keep=0)
+        assert skipped.written is True, skipped
+        assert skipped.backup_path is None, skipped
+        assert list(backup_dir.glob("*.toml")) == [], "keep=0 不应写出任何备份"
+
+        # keep>0 时照常备份，且只保留最近 N 份
+        for index in range(3):
+            host.apply({"replyer": [f"m{index}"]}, backup_dir=backup_dir, backup_keep=2)
+        files = sorted(backup_dir.glob("model_config_*.toml"))
+        assert len(files) == 2, [path.name for path in files]
+
+
+def test_backup_file_permissions() -> None:
+    """备份是完整宿主配置（含 api_key），写完后在 POSIX 上必须是 0600。"""
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        _config_path, host, _store, _logger = _make_workspace(tmp)
+        result = host.apply({"replyer": ["deepseek-v4-flash"]}, backup_dir=tmp / "backups", backup_keep=3)
+        assert result.backup_path is not None, result
+        assert result.backup_path.is_file()
+        if os.name == "posix":
+            mode = result.backup_path.stat().st_mode & 0o777
+            assert mode == 0o600, oct(mode)
+
+
+def test_settings_builder_reads_llm_unfreeze_switch() -> None:
+    """解冻工具开关必须能从配置读出，且缺字段/旧配置时回落为关闭。"""
+
+    import types
+
+    assert build_settings(_config_stub(admin_ids=[])).allow_llm_unfreeze is False
+    assert (
+        build_settings(_config_stub(admin_ids=["10001"], allow_llm_unfreeze=True)).allow_llm_unfreeze
+        is True
+    )
+
+    legacy = types.SimpleNamespace(
+        plugin=types.SimpleNamespace(enabled=True, admin_user_ids=[]),
+        detect=None,
+        freeze=None,
+        notify=None,
+        advanced=None,
+    )
+    assert build_settings(legacy).allow_llm_unfreeze is False, "旧配置缺字段时必须默认关闭"
 
 
 def test_restore_warns_when_list_edited_manually() -> None:
