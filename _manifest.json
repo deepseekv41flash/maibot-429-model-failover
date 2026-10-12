@@ -1,0 +1,40 @@
+{
+  "manifest_version": 2,
+  "id": "local.429-model-failover",
+  "version": "1.2.4",
+  "name": "429 限流熔断与模型自动切换",
+  "description": "检测模型请求返回 429（限流）后，把该模型从所属任务（模型类别）的备选列表里暂时移除并切换到下一个备选模型，冻结到期后自动还原；冻结时长可按模型单独配置（如按 5 小时或按天限流的模型）。",
+  "author": {
+    "name": "deepseekv41flash",
+    "url": "https://github.com/deepseekv41flash"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/deepseekv41flash/maibot-429-model-failover",
+    "documentation": "https://github.com/deepseekv41flash/maibot-429-model-failover#readme"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "999.999.999"
+  },
+  "sdk": {
+    "min_version": "2.6.0",
+    "max_version": "999.999.999"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "shield-alert"
+    }
+  }
+}
