@@ -123,14 +123,28 @@ class FailureDetector:
 
     # ------------------------------------------------------------------ 对外
 
-    def describe_sources(self) -> str:
-        """描述当前数据来源可用性。"""
+    def describe_sources(self, show_paths: bool = True) -> str:
+        """描述当前数据来源可用性。
 
-        parts = []
+        Args:
+            show_paths: 是否回显宿主侧的绝对路径。``False`` 时只给出可用性，
+                不回显目录 —— ``/429状态`` 对所有人开放，默认不该把服务器的
+                目录布局发进聊天。
+        """
+
+        def describe(label: str, path: object, ok: bool) -> str:
+            """生成一行来源描述。"""
+
+            if show_paths:
+                return f"{label} {'可用' if ok else '不可用'}（{path or '未解析'}）"
+            return f"{label} {'可用' if ok else '不可用'}（宿主路径仅管理员可见）"
+
         snapshot_ok = bool(self.error_dir and self.error_dir.is_dir())
         log_ok = bool(self.log_dir and self.log_dir.is_dir())
-        parts.append(f"快照目录 {'可用' if snapshot_ok else '不可用'}（{self.error_dir or '未解析'}）")
-        parts.append(f"日志目录 {'可用' if log_ok else '不可用'}（{self.log_dir or '未解析'}）")
+        parts = [
+            describe("快照目录", self.error_dir, snapshot_ok),
+            describe("日志目录", self.log_dir, log_ok),
+        ]
         if self._stale_log_skipped:
             parts.append(f"已丢弃过旧日志事件 {self._stale_log_skipped} 条")
         return "；".join(parts)

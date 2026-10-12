@@ -1005,6 +1005,148 @@ def test_plugin_reload_confirmation_state_machine() -> None:
     assert plugin._awaiting_reload_at == 0.0
 
 
+def test_describe_sources_hides_host_paths() -> None:
+    """数据来源描述：默认回显路径，``show_paths=False`` 时只给可用性。
+
+    ``/429状态`` 命令对所有人开放，宿主目录布局不应出现在聊天回复里。
+    """
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        error_dir = tmp / "logs" / "maisaka_prompt" / "llm_error" / "system"
+        error_dir.mkdir(parents=True)
+        log_dir = tmp / "logs"
+        detector = FailureDetector(
+            logger=ListLogger(), error_dir=error_dir, log_dir=log_dir, status_codes=(429,)
+        )
+
+        visible = detector.describe_sources()
+        assert str(error_dir) in visible, visible
+        assert str(log_dir) in visible, visible
+
+        hidden = detector.describe_sources(show_paths=False)
+        assert str(tmp) not in hidden, hidden
+        assert "仅管理员可见" in hidden, hidden
+        assert "可用" in hidden, hidden
+
+
+def _config_stub(*, admin_ids: List[str]) -> Any:
+    """构造 ``build_settings`` 能用的最小配置对象（不依赖 SDK 的配置模型）。"""
+
+    import types
+
+    return types.SimpleNamespace(
+        plugin=types.SimpleNamespace(enabled=True, admin_user_ids=list(admin_ids)),
+        detect=None,
+        freeze=None,
+        notify=None,
+        advanced=None,
+    )
+
+
+def _sendable_plugin(module: Any, *, admin_ids: List[str]) -> tuple:
+    """按宿主方式构造插件实例，附一份最小配置与可观测的 ctx。"""
+
+    import logging
+    import types
+
+    sent: List[str] = []
+
+    class _Send:
+        async def text(self, text: str, stream_id: str = "", **kwargs: Any) -> bool:
+            """记录被发送的文本。"""
+
+            del stream_id, kwargs
+            sent.append(text)
+            return True
+
+    plugin = module.create_plugin()
+    plugin._ctx = types.SimpleNamespace(
+        logger=logging.getLogger("test.429-failover-permission"),
+        send=_Send(),
+    )
+    plugin._plugin_config_instance = _config_stub(admin_ids=admin_ids)
+    return plugin, sent
+
+
+def test_status_command_hides_host_paths_from_non_admin() -> None:
+    """``/429状态`` 对所有人开放：宿主绝对路径只回显给管理员。"""
+
+    import importlib.util
+    import types
+
+    if importlib.util.find_spec("maibot_sdk") is None:
+        print("    （跳过：本机没有 maibot_sdk，请在 MaiBot 容器内运行）")
+        return
+
+    module = _load_plugin_module()
+    plugin, sent = _sendable_plugin(module, admin_ids=["10001"])
+    plugin._manager = types.SimpleNamespace(
+        status_lines=lambda: ["当前没有被冻结的模型。"],
+        health_lines=lambda: [],
+    )
+    host_path = Path("/root/docker-config/mmc/model_config.toml")
+    plugin._host_config = types.SimpleNamespace(path=host_path)
+    plugin._detector = types.SimpleNamespace(
+        describe_sources=lambda show_paths=True: (
+            "快照目录 可用（/root/data/MaiMBot/logs/maisaka_prompt/llm_error）；日志目录 可用（/root/data/MaiMBot/logs）"
+            if show_paths
+            else "快照目录 可用（宿主路径仅管理员可见）；日志目录 可用（宿主路径仅管理员可见）"
+        )
+    )
+
+    # 普通用户：不得出现宿主绝对路径
+    asyncio.run(plugin.show_status(stream_id="qq_group_1", user_id="20002"))
+    assert str(host_path) not in sent[-1], sent[-1]
+    assert "/root/data/MaiMBot/logs" not in sent[-1], sent[-1]
+    assert "model_config.toml" in sent[-1], sent[-1]
+    assert "宿主路径仅管理员可见" in sent[-1], sent[-1]
+
+    # 管理员：可以看到路径，便于排障
+    asyncio.run(plugin.show_status(stream_id="qq_group_1", user_id="10001"))
+    assert str(host_path) in sent[-1], sent[-1]
+    assert "/root/data/MaiMBot/logs" in sent[-1], sent[-1]
+    assert "仅管理员可见" not in sent[-1], sent[-1]
+
+
+def test_unfreeze_tool_requires_admin() -> None:
+    """解冻工具与 ``/429解冻`` 同权限：非管理员调用必须被拒绝，且不得触碰管理器。"""
+
+    import importlib.util
+    import types
+
+    if importlib.util.find_spec("maibot_sdk") is None:
+        print("    （跳过：本机没有 maibot_sdk，请在 MaiBot 容器内运行）")
+        return
+
+    module = _load_plugin_module()
+    plugin, _sent = _sendable_plugin(module, admin_ids=["10001"])
+    calls: List[tuple] = []
+
+    async def _unfreeze(task: str, model: str) -> tuple:
+        """记录一次解冻调用。"""
+
+        calls.append((task, model))
+        return 1, ["已解冻 1 条记录"]
+
+    plugin._manager = types.SimpleNamespace(unfreeze=_unfreeze)
+
+    # 普通用户（含模型被诱导调用的情况）：拒绝，且不产生任何改写
+    denied = asyncio.run(plugin.tool_unfreeze(task="utils", model="m", user_id="20002"))
+    assert calls == [], "非管理员不得触发解冻"
+    assert "管理员" in denied["content"], denied
+
+    # 上下文缺失 user_id（无法确认调用者）：同样拒绝（fail-closed）
+    denied_anon = asyncio.run(plugin.tool_unfreeze(task="utils", model="m"))
+    assert calls == [], "缺少 user_id 时必须拒绝"
+    assert "管理员" in denied_anon["content"], denied_anon
+
+    # 管理员：放行
+    allowed = asyncio.run(plugin.tool_unfreeze(task="utils", model="m", user_id="10001"))
+    assert calls == [("utils", "m")], calls
+    assert "已解冻" in allowed["content"], allowed
+
+
 def test_restore_warns_when_list_edited_manually() -> None:
     """冻结期间有人改过列表时，还原要照做，但要留下明确告警。"""
 

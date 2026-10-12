@@ -660,9 +660,17 @@ class ModelFailoverPlugin(MaiBotPlugin):
     async def show_status(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
         """输出当前冻结状态。"""
 
-        del kwargs
         if self._manager is None:
             return False, "插件尚未完成初始化", 2
+
+        # 本命令对所有人开放，因此宿主侧的绝对路径只回显给管理员：
+        # 否则群里任何人发一句 /429 就能拿到服务器的目录布局。
+        settings = build_settings(self.config)
+        is_admin = settings.is_admin(
+            str(kwargs.get("user_id", "")),
+            bool(kwargs.get("is_local_operator")),
+        )
+
         text = "\n".join(
             [f"{PLUGIN_DISPLAY_NAME} 状态"]
             + self._manager.status_lines()
@@ -670,9 +678,14 @@ class ModelFailoverPlugin(MaiBotPlugin):
             + [self._reload_status_line()]
         )
         if self._host_config is not None:
-            text += f"\n模型配置：{self._host_config.path}"
+            target = (
+                str(self._host_config.path)
+                if is_admin
+                else f"{self._host_config.path.name}（宿主路径仅管理员可见）"
+            )
+            text += f"\n模型配置：{target}"
         if self._detector is not None:
-            text += f"\n数据来源：{self._detector.describe_sources()}"
+            text += f"\n数据来源：{self._detector.describe_sources(show_paths=is_admin)}"
         await self.ctx.send.text(text, stream_id)
         return True, text, 2
 
@@ -786,9 +799,20 @@ class ModelFailoverPlugin(MaiBotPlugin):
         ],
     )
     async def tool_unfreeze(self, task: str = "", model: str = "", **kwargs: Any) -> Dict[str, str]:
-        """给 LLM 的解冻工具。"""
+        """给 LLM 的解冻工具（与 ``/429解冻`` 同权限：仅插件管理员可用）。
 
-        del kwargs
+        工具会被模型自主调用，因此这里必须和命令走同一道管理员校验 —— 否则任何
+        能让机器人调用工具的聊天用户都能绕过 ``/429解冻`` 的权限限制去改写宿主配置。
+        宿主会把 ``user_id`` / ``group_id`` / ``platform`` / ``stream_id`` 放进工具
+        handler 的 kwargs（``component_query.py::_build_tool_context_payload``）。
+        """
+
+        settings = build_settings(self.config)
+        if not settings.is_admin(
+            str(kwargs.get("user_id", "")),
+            bool(kwargs.get("is_local_operator")),
+        ):
+            return {"content": "只有插件管理员可以解冻模型（与 /429解冻 同权限）；请让管理员执行。"}
         if self._manager is None:
             return {"content": "429 熔断插件尚未完成初始化"}
         _count, messages = await self._manager.unfreeze(str(task).strip(), str(model).strip())
